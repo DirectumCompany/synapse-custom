@@ -1,0 +1,77 @@
+# syntax=docker/dockerfile:1
+
+# Modified by Directum, 2026
+
+ARG DEBIAN_VERSION=trixie
+ARG PYTHON_VERSION=3.13
+
+# Регистрируем заранее скачанный образ Rust как этап сборки
+FROM docker.io/library/rust:slim-${DEBIAN_VERSION} AS rust-toolchain
+
+FROM ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-${DEBIAN_VERSION} AS builder
+
+ENV UV_LINK_MODE=copy
+ENV RUSTUP_HOME=/rust
+ENV CARGO_HOME=/cargo
+ENV PATH=/cargo/bin:/rust/bin:$PATH
+ENV CARGO_NET_OFFLINE=true
+
+# Копируем компилятор Rust из локального базового образа
+COPY --from=rust-toolchain /usr/local/rustup /rust
+COPY --from=rust-toolchain /usr/local/cargo /cargo
+
+# Копируем выгруженный кэш с жесткого диска ПК
+COPY docker/offline-cache/wheels /wheels
+COPY docker/offline-cache/vendor /synapse/vendor
+COPY docker/offline-cache/requirements.txt /offline/requirements.txt
+
+# Настраиваем Cargo на работу с локальной папкой vendor
+RUN printf '[source.crates-io]\nreplace-with = "vendored-sources"\n[source.vendored-sources]\ndirectory = "/synapse/vendor"\n' > /cargo/config.toml
+
+# Ставим сборочные инструменты и все зависимости строго из локальной папки /wheels
+RUN uv pip install --system --offline --no-index --find-links=/wheels poetry-core setuptools-rust maturin wheel build && \
+    uv pip install --prefix="/install" --offline --no-index --find-links=/wheels --no-deps -r /offline/requirements.txt
+
+# Копируем исходники Synapse
+COPY synapse /synapse/synapse/
+COPY rust /synapse/rust/
+COPY pyproject.toml README.rst build_rust.py Cargo.toml Cargo.lock /synapse/
+
+# Компилируем Rust-модули и устанавливаем Synapse без доступа в сеть (используем --no-build-isolation, чтобы не качать poetry-core из сети)
+RUN uv pip install --prefix="/install" --offline --no-index --find-links=/wheels --no-build-isolation --no-deps /synapse[all]
+
+# Финальный рабочий образ
+# TODO: заменить на базовый
+FROM docker.io/library/python:${PYTHON_VERSION}-slim-${DEBIAN_VERSION}
+
+ARG TARGETARCH
+ARG SYNAPSE_VERSION_STRING
+ENV SYNAPSE_VERSION_STRING=${SYNAPSE_VERSION_STRING}
+
+LABEL org.opencontainers.image.url='https://github.com/element-hq/synapse'
+LABEL org.opencontainers.image.documentation='https://element-hq.github.io/synapse/latest/'
+LABEL org.opencontainers.image.source='https://github.com/DirectumCompany/synapse-custom'
+LABEL org.opencontainers.image.licenses='AGPL-3.0-or-later'
+LABEL org.opencontainers.image.vendor='Directum'
+LABEL org.opencontainers.image.description='Custom multi-stage build of Matrix Synapse based on https://github.com/element-hq/synapse'
+
+# Распаковываем системные библиотеки Debian с сохранением всех симлинков
+COPY docker/offline-cache/debian-libs.tar /tmp/debian-libs.tar
+RUN tar -xf /tmp/debian-libs.tar -C /tmp && \
+    cp -a /tmp/install-${TARGETARCH}/etc/* /etc/ && \
+    cp -a /tmp/install-${TARGETARCH}/usr/* /usr/ && \
+    cp -a /tmp/install-${TARGETARCH}/var/* /var/ && \
+    rm -rf /tmp/debian-libs.tar /tmp/install-*
+
+# Копируем скомпилированный Synapse и назначаем права запуска для start.py
+COPY --from=builder  --exclude=.lock /install /usr/local
+COPY ./docker/start.py /start.py
+COPY ./docker/conf /conf
+
+EXPOSE 8008/tcp 8448/tcp
+EXPOSE 19090/tcp
+
+ENTRYPOINT ["/start.py"]
+
+HEALTHCHECK --start-period=5s --interval=15s --timeout=5s \
+  CMD curl -fSs http://localhost:8008/health || exit 1
