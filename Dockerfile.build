@@ -1,50 +1,13 @@
 # syntax=docker/dockerfile:1
 
 # Modified by Directum, 2026
+#
+# Этап 2 (офлайн): итоговый образ на базовом образе Directum (ALT Linux).
+# Всё необходимое берётся из docker/offline-cache, подготовленного Dockerfile.fetch.
 
-ARG DEBIAN_VERSION=trixie
-ARG PYTHON_VERSION=3.13
+ARG RUNTIME_IMAGE=devregistry.directum.ru/directum/rx-base/pango:26.3.fstek
+FROM ${RUNTIME_IMAGE}
 
-# Регистрируем заранее скачанный образ Rust как этап сборки
-FROM docker.io/library/rust:slim-${DEBIAN_VERSION} AS rust-toolchain
-
-FROM ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-${DEBIAN_VERSION} AS builder
-
-ENV UV_LINK_MODE=copy
-ENV RUSTUP_HOME=/rust
-ENV CARGO_HOME=/cargo
-ENV PATH=/cargo/bin:/rust/bin:$PATH
-ENV CARGO_NET_OFFLINE=true
-
-# Копируем компилятор Rust из локального базового образа
-COPY --from=rust-toolchain /usr/local/rustup /rust
-COPY --from=rust-toolchain /usr/local/cargo /cargo
-
-# Копируем выгруженный кэш с жесткого диска ПК
-COPY docker/offline-cache/wheels /wheels
-COPY docker/offline-cache/vendor /synapse/vendor
-COPY docker/offline-cache/requirements.txt /offline/requirements.txt
-
-# Настраиваем Cargo на работу с локальной папкой vendor
-RUN printf '[source.crates-io]\nreplace-with = "vendored-sources"\n[source.vendored-sources]\ndirectory = "/synapse/vendor"\n' > /cargo/config.toml
-
-# Ставим сборочные инструменты и все зависимости строго из локальной папки /wheels
-RUN uv pip install --system --offline --no-index --find-links=/wheels poetry-core setuptools-rust maturin wheel build && \
-    uv pip install --prefix="/install" --offline --no-index --find-links=/wheels --no-deps -r /offline/requirements.txt
-
-# Копируем исходники Synapse
-COPY synapse /synapse/synapse/
-COPY rust /synapse/rust/
-COPY pyproject.toml README.rst build_rust.py Cargo.toml Cargo.lock /synapse/
-
-# Компилируем Rust-модули и устанавливаем Synapse без доступа в сеть (используем --no-build-isolation, чтобы не качать poetry-core из сети)
-RUN uv pip install --prefix="/install" --offline --no-index --find-links=/wheels --no-build-isolation --no-deps /synapse[all]
-
-# Финальный рабочий образ
-# TODO: заменить на базовый
-FROM docker.io/library/python:${PYTHON_VERSION}-slim-${DEBIAN_VERSION}
-
-ARG TARGETARCH
 ARG SYNAPSE_VERSION_STRING
 ENV SYNAPSE_VERSION_STRING=${SYNAPSE_VERSION_STRING}
 
@@ -55,16 +18,29 @@ LABEL org.opencontainers.image.licenses='AGPL-3.0-or-later'
 LABEL org.opencontainers.image.vendor='Directum'
 LABEL org.opencontainers.image.description='Custom multi-stage build of Matrix Synapse based on https://github.com/element-hq/synapse'
 
-# Распаковываем системные библиотеки Debian с сохранением всех симлинков
-COPY docker/offline-cache/debian-libs.tar /tmp/debian-libs.tar
-RUN tar -xf /tmp/debian-libs.tar -C /tmp && \
-    cp -a /tmp/install-${TARGETARCH}/etc/* /etc/ && \
-    cp -a /tmp/install-${TARGETARCH}/usr/* /usr/ && \
-    cp -a /tmp/install-${TARGETARCH}/var/* /var/ && \
-    rm -rf /tmp/debian-libs.tar /tmp/install-*
+# Системные пакеты (Python 3.12, curl, gosu, библиотеки) из заранее скачанных rpm
+COPY docker/offline-cache/rpms /tmp/rpms
+RUN rpm -Uvh --replacepkgs /tmp/rpms/*.rpm && rm -rf /tmp/rpms && \
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python && \
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python3
 
-# Копируем скомпилированный Synapse и назначаем права запуска для start.py
-COPY --from=builder  --exclude=.lock /install /usr/local
+# start.py запускает /usr/sbin/gosu (путь Debian), в ALT он лежит в /usr/bin
+RUN ln -sf /usr/bin/gosu /usr/sbin/gosu
+
+# Python-зависимости и Synapse строго из локальной папки wheels (pip запускается из собственного wheel)
+COPY docker/offline-cache/wheels /wheels
+COPY docker/offline-cache/requirements.txt /offline/requirements.txt
+RUN export PYTHONPATH="$(ls /wheels/pip-*.whl | head -n 1)" && \
+    python -m pip install --no-index --find-links=/wheels --no-deps -r /offline/requirements.txt && \
+    python -m pip install --no-index --find-links=/wheels --no-deps /wheels/matrix_synapse-*.whl && \
+    rm -rf /wheels /offline
+
+# jemalloc: start.py ищет библиотеку по пути Debian, на ALT делаем ссылку
+RUN set -e; \
+    for f in /usr/lib64/libjemalloc.so.2 /usr/lib/libjemalloc.so.2; do \
+      if [ -f "$f" ]; then mkdir -p /usr/lib/x86_64-linux-gnu && ln -sf "$f" /usr/lib/x86_64-linux-gnu/libjemalloc.so.2; break; fi; \
+    done
+
 COPY ./docker/start.py /start.py
 COPY ./docker/conf /conf
 
